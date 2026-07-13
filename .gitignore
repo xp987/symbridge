@@ -1,0 +1,43 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.venv/
+venv/
+
+# C++ / x64dbg plugin build
+build/
+*.obj
+*.dll
+*.exp
+*.lib
+*.pdb
+*.ilk
+*.dp64
+*.dp32
+*.exe
+build.log
+
+# IDA
+*.id0
+*.id1
+*.id2
+*.nam
+*.til
+*.i64
+*.idb
+
+# OS / editor
+.DS_Store
+.vscode/
+.idea/
+
+# --- Internal coordination / planning (kept local, not published) ---
+/HANDOFF.md
+/PLAN.md
+
+# --- Dev scratch: publish only the reusable demo client ---
+dev/*
+!dev/__init__.py
+!dev/simclient.py

@@ -1,0 +1,121 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "symbridge wire protocol",
+  "description": "Newline-delimited JSON messages exchanged between the broker and tool adapters. Every physical line on the socket is exactly one of these objects.",
+  "oneOf": [
+    { "$ref": "#/definitions/hello" },
+    { "$ref": "#/definitions/snapshot" },
+    { "$ref": "#/definitions/update" },
+    { "$ref": "#/definitions/ack" }
+  ],
+  "definitions": {
+    "hello": {
+      "type": "object",
+      "description": "client -> broker: announce identity on connect. Broker replies with a snapshot.",
+      "required": ["type", "client_id"],
+      "properties": {
+        "type": { "const": "hello" },
+        "client_id": { "type": "string", "description": "unique id for this adapter instance (used as origin)" },
+        "tool": { "type": "string", "enum": ["ida", "x64dbg", "ghidra", "binaryninja", "test", "unknown"] }
+      }
+    },
+    "snapshot": {
+      "type": "object",
+      "description": "broker -> client: full current canonical state.",
+      "required": ["type", "records"],
+      "properties": {
+        "type": { "const": "snapshot" },
+        "records": { "type": "array", "items": { "$ref": "#/definitions/record" } }
+      }
+    },
+    "update": {
+      "type": "object",
+      "description": "both ways: a single changed record. Broker never echoes it back to `origin`.",
+      "required": ["type", "record", "data"],
+      "properties": {
+        "type": { "const": "update" },
+        "origin": { "type": "string", "description": "client_id that produced this change" },
+        "seq": { "type": ["integer", "null"], "description": "optional sequence number, echoed back in ack" },
+        "record": { "$ref": "#/definitions/recordDiscriminator" },
+        "data": { "type": "object" }
+      }
+    },
+    "ack": {
+      "type": "object",
+      "description": "broker -> client: receipt for a processed update.",
+      "required": ["type"],
+      "properties": {
+        "type": { "const": "ack" },
+        "seq": { "type": ["integer", "null"] }
+      }
+    },
+    "recordDiscriminator": {
+      "type": "string",
+      "enum": ["symbol", "comment", "type"]
+    },
+    "record": {
+      "type": "object",
+      "description": "A single annotation in wire form, as embedded in snapshot/update.",
+      "required": ["record", "data"],
+      "properties": {
+        "record": { "$ref": "#/definitions/recordDiscriminator" },
+        "data": { "type": "object" }
+      },
+      "oneOf": [
+        { "$ref": "#/definitions/symbolRecord" },
+        { "$ref": "#/definitions/commentRecord" },
+        { "$ref": "#/definitions/typeRecord" }
+      ]
+    },
+    "symbolRecord": {
+      "properties": {
+        "record": { "const": "symbol" },
+        "data": {
+          "type": "object",
+          "required": ["module", "rva", "name"],
+          "properties": {
+            "module": { "type": "string", "description": "module/image name, e.g. target.exe" },
+            "rva": { "type": "integer", "description": "relative virtual address (addr - module base)" },
+            "name": { "type": "string" },
+            "origin": { "type": "string" },
+            "ts": { "type": "number", "description": "epoch seconds; last-write-wins" }
+          }
+        }
+      }
+    },
+    "commentRecord": {
+      "properties": {
+        "record": { "const": "comment" },
+        "data": {
+          "type": "object",
+          "required": ["module", "rva", "text"],
+          "properties": {
+            "module": { "type": "string" },
+            "rva": { "type": "integer" },
+            "text": { "type": "string" },
+            "kind": { "type": "string", "enum": ["regular", "repeatable"], "default": "regular" },
+            "origin": { "type": "string" },
+            "ts": { "type": "number" }
+          }
+        }
+      }
+    },
+    "typeRecord": {
+      "properties": {
+        "record": { "const": "type" },
+        "data": {
+          "type": "object",
+          "required": ["module", "name", "decl"],
+          "properties": {
+            "module": { "type": "string" },
+            "name": { "type": "string", "description": "type/struct name" },
+            "decl": { "type": "string", "description": "canonical C declaration text, e.g. 'struct Foo { int a; };'" },
+            "deleted": { "type": "boolean", "default": false, "description": "persistent tombstone; decl is empty when true" },
+            "origin": { "type": "string" },
+            "ts": { "type": "number" }
+          }
+        }
+      }
+    }
+  }
+}
