@@ -30,8 +30,9 @@ bridge.
 - **Address-independent:** everything is keyed by `(module, RVA)`, so ASLR and
   different image bases never matter — a function at RVA `0x1500` lines up in
   both tools automatically.
-- **Live:** local edits are captured via IDA's `IDB_Hooks` and an x64dbg polling
-  thread, relayed instantly through a broker.
+- **Live:** local edits are captured via IDA's `IDB_Hooks` and x64dbg's
+  `CB_DBOPERATION` database callbacks, relayed instantly through a broker.
+  Deleting a label or comment syncs too.
 - **Loop-free:** every change carries an `origin`; the broker never echoes it
   back, and adapters guard with an "applying remote" flag.
 - **Persistent:** run the broker with `--persist state.json` and your
@@ -125,7 +126,9 @@ The C++ type-diff logic has its own tests under `tests/type_sync_tests.cpp`.
 ## Roadmap
 
 - Ghidra and Binary Ninja adapters (same protocol, new spoke).
-- Native x64dbg change events to replace polling if/when exposed.
+- ~~Native x64dbg change events to replace polling if/when exposed~~ — done:
+  labels/comments now use x64dbg's `CB_DBOPERATION` callbacks (x64dbg#2259);
+  only the watched type header is still polled.
 - Richer type support beyond structs/unions/enums with primitive & array fields.
 
 ## License

@@ -11,10 +11,18 @@ x64dbg and IDA.
 - **Broker → x64dbg types:** batches canonical C declarations into a generated
   header and imports it with x64dbg's native `ParseTypes` command. Each reload
   replaces the preceding symbridge-owned type generation.
-- **x64dbg → broker:** x64dbg emits no reliable label/comment-change event, so a
-  background thread polls `Script::Label::GetList` / `Comment::GetList` every
-  ~750 ms and sends whatever changed. Applied remote values are seeded into the
-  same "last seen" maps, so they are never echoed back.
+- **x64dbg → broker:** label/comment edits are captured through x64dbg's
+  `CB_DBOPERATION` plugin callback
+  ([x64dbg#2259](https://github.com/x64dbg/x64dbg/issues/2259)): the debugger
+  reports every annotation-database add/remove (single edits and batched bulk
+  operations) synchronously on the mutating thread, so changes reach the broker
+  instantly instead of on a poll tick. Removals — invisible to the old poll+diff
+  approach — travel as empty-text updates, which both adapters treat as "clear".
+  Annotations replayed from a `.dd64` database load are flagged (`dbload`) and
+  skipped; use **Push all annotations** to seed a broker from an existing
+  database. Echo is prevented with a thread-local "applying remote" flag: the
+  callback fires on the thread that applied the change, so the plugin's own
+  writes are filtered out.
 - **x64dbg → broker types:** watches an x64dbg-owned C header, diffs its named
   `struct`/`union`/`enum` definitions, imports the aggregate through `ParseTypes`,
   and publishes create/edit/delete records. A rename is delete+create.
@@ -25,6 +33,12 @@ x64dbg and IDA.
 
 Needs the x64dbg **plugin SDK** (the `pluginsdk` folder from an x64dbg snapshot)
 and MSVC (Visual Studio Build Tools).
+
+> **SDK/runtime requirement:** the plugin uses the `CB_DBOPERATION` callback,
+> so both the `pluginsdk` you build against and the x64dbg you run under must
+> include x64dbg#2259 (a `_plugins.h` that defines `CB_DBOPERATION`). Loading
+> the plugin in an older x64dbg is unsupported — callback registration there
+> indexes past the core's callback table.
 
 ### Quick (batch)
 
@@ -88,8 +102,9 @@ symbridgetypesync
 
 - Only the **main debuggee module** is synced. Load the target before Connect so
   incoming updates resolve (`BaseFromName` needs the module present).
-- Poll latency is ~750 ms (not instant). Native change events can replace polling
-  later if x64dbg exposes them.
+- Labels/comments sync instantly (event-driven). Only the watched **type
+  header** is still polled (~750 ms) — type definitions are not part of
+  x64dbg's annotation database, so `CB_DBOPERATION` cannot observe them.
 - Type edits made through x64dbg's built-in `AddStruct`/`AddMember` commands
   cannot be reconstructed through the public plugin SDK: `EnumStructs` exposes
   names only. Use the watched canonical header for outbound type changes.
