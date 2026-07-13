@@ -130,5 +130,4 @@ The C++ type-diff logic has its own tests under `tests/type_sync_tests.cpp`.
 
 ## License
 
-MIT — free to use, modify, and distribute. Add a `LICENSE` file with your name
-before publishing.
+[MIT](LICENSE) — free to use, modify, and distribute.
