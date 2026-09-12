@@ -9,7 +9,7 @@
 #include "jansson.h"
 
 #define PLUGIN_NAME "symbridge"
-#define PLUGIN_VERSION 2
+#define PLUGIN_VERSION 3
 
 // x64dbg plugin entry points (exported from the .dp64).
 extern "C" __declspec(dllexport) bool pluginit(PLUG_INITSTRUCT* initStruct);

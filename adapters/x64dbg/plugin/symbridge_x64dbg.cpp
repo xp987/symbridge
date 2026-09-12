@@ -1,15 +1,22 @@
 // symbridge x64dbg adapter.
 //
 // Mirrors the Python IDA adapter: connects to the symbridge broker, applies
-// remote name/comment/type updates to x64dbg, and pushes local annotations back. x64dbg
-// emits no reliable label/comment-change event, so local->broker is done with
-// a background poll+diff thread (~750ms). Echo is prevented by recording every
-// value we *apply* into the same "last seen" maps the poll diffs against, so an
-// applied remote change is never re-broadcast.
+// remote name/comment/type updates to x64dbg, and pushes local annotations
+// back. Local label/comment edits are captured through the CB_DBOPERATION
+// plugin callback (x64dbg #2259): the debugger invokes it synchronously on the
+// thread that mutates the annotation database, both for single edits and for
+// batched bulk operations (clear/range-delete), and reports removals too --
+// which the old poll+diff thread could never see. Deletions travel as
+// empty-text updates (both tools treat an empty name/comment as "clear").
+// Echo is prevented with a thread-local "applying remote" flag: the callback
+// fires on the applying thread, so our own writes are filtered out before
+// they reach the broker. Type definitions are not part of the annotation
+// database, so the watched type header is still polled (~750ms).
 //
-// Address model: on the wire we carry only (module, rva). x64dbg's LabelInfo /
-// CommentInfo already give us mod+rva directly; to apply we resolve
-// addr = Script::Module::BaseFromName(mod) + rva.
+// Address model: on the wire we carry only (module, rva). CB_DBOPERATION
+// reports (modhash, module-relative address); the main module's hash is
+// resolved once per session via the mod.hash() expression function. To apply
+// we resolve addr = Script::Module::BaseFromName(mod) + rva.
 //
 // Build: see CMakeLists.txt (links x64dbg.lib, x64bridge.lib, jansson, ws2_32).
 
@@ -208,6 +215,11 @@ private:
 // adapter (single global instance)
 // ---------------------------------------------------------------------------
 
+// CB_DBOPERATION fires synchronously on the thread performing the database
+// write. Set while this plugin applies a remote update so the resulting
+// callback is recognized as an echo and not re-broadcast.
+static thread_local bool tApplyingRemote = false;
+
 class Adapter
 {
 public:
@@ -250,10 +262,43 @@ public:
             return;
         }
         refreshModule();
-        scanLabels(true);
-        scanComments(true);
+        scanLabels();
+        scanComments();
         syncLocalTypeFile(true);
         _plugin_logprintf("[symbridge] pushed all labels/comments/types\n");
+    }
+
+    // CB_DBOPERATION handler: forward local annotation edits to the broker.
+    // Runs on whatever thread performed the database write; text pointers in
+    // the operations are only valid for the duration of the callback.
+    void onDbOperations(const PLUG_CB_DBOPERATION* info)
+    {
+        if (tApplyingRemote)
+            return; // our own apply of a remote update; broker already has it
+        if (!client_.connected() || !DbgIsDebugging())
+            return;
+        duint mainHash = mainModHash_.load();
+        if (!mainHash)
+            return;
+        std::string module = currentModule();
+        for (size_t i = 0; i < info->count; i++)
+        {
+            const DbOperation& op = info->operations[i];
+            // Skip annotations replayed from the .dd64 database file: they
+            // are not user edits, and the broker snapshot is authoritative
+            // (use "Push all annotations" to seed a broker from a database).
+            if (op.dbload)
+                continue;
+            if (op.modhash != mainHash)
+                continue; // symbridge only syncs the main module
+            bool add = op.opType == DbOperationTypeAdd;
+            if (op.itemType == DbItemTypeLabel)
+                sendSymbol(module, op.address, add && op.text ? op.text : "");
+            else if (op.itemType == DbItemTypeComment)
+                sendComment(module, op.address, add && op.text ? op.text : "");
+            // functions/bookmarks/loops/arguments are not part of the wire
+            // protocol (yet); ignore those item types.
+        }
     }
 
     bool watchTypeFile(const std::string& path)
@@ -564,11 +609,13 @@ private:
             pending_.push_back({PEND_LABEL, module, rva, name});
             return;
         }
-        std::lock_guard<std::mutex> lk(stateMutex_);
+        // The Set below triggers CB_DBOPERATION on this thread; the flag stops
+        // the callback from bouncing the remote update straight back.
+        tApplyingRemote = true;
         // 4-arg overload (…, manual, temporary) picked explicitly to avoid an
         // ambiguous-overload error against the 3-arg form.
         Script::Label::Set(base + rva, name.c_str(), true, false);
-        lastLabels_[rva] = name; // seed so the poll won't echo it back
+        tApplyingRemote = false;
         GuiUpdateAllViews();
     }
 
@@ -581,13 +628,16 @@ private:
             pending_.push_back({PEND_COMMENT, module, rva, text});
             return;
         }
-        std::lock_guard<std::mutex> lk(stateMutex_);
+        tApplyingRemote = true;
         Script::Comment::Set(base + rva, text.c_str(), true);
-        lastComments_[rva] = text;
+        tApplyingRemote = false;
         GuiUpdateAllViews();
     }
 
-    // -- outbound poll (poll thread) ----------------------------------------
+    // -- outbound type poll (poll thread) ------------------------------------
+    // Labels/comments are event-driven via CB_DBOPERATION. Types are carried
+    // as C text in a watched header file, which x64dbg's database callbacks
+    // cannot observe, so keep a slow poll for that file only.
 
     void pollLoop()
     {
@@ -597,8 +647,6 @@ private:
             if (!client_.connected() || !DbgIsDebugging())
                 continue;
             refreshModule();
-            scanLabels(false);
-            scanComments(false);
             syncLocalTypeFile(false);
         }
     }
@@ -679,50 +727,58 @@ private:
         char name[MAX_MODULE_SIZE] = "";
         if (Script::Module::GetMainModuleName(name))
         {
-            std::lock_guard<std::mutex> lk(stateMutex_);
-            module_ = toLower(name);
+            {
+                std::lock_guard<std::mutex> lk(stateMutex_);
+                module_ = toLower(name);
+            }
+            // Resolve the main module's database hash so CB_DBOPERATION events
+            // can be matched back to it. modhash is not exposed to plugins
+            // directly; mod.hash() is the supported expression for it.
+            duint base = Script::Module::GetMainModuleBase();
+            if (base)
+            {
+                char expr[64];
+                sprintf_s(expr, "mod.hash(0x%llX)", (unsigned long long)base);
+                duint hash = DbgValFromString(expr);
+                if (hash)
+                    mainModHash_ = hash;
+            }
+        }
+        else
+        {
+            mainModHash_ = 0;
         }
     }
 
-    void scanLabels(bool forceAll)
+    // Full-list senders, used by pushAll only (live edits arrive per-operation
+    // through CB_DBOPERATION).
+    void scanLabels()
     {
         BridgeList<Script::Label::LabelInfo> labels;
         if (!Script::Label::GetList(&labels))
             return;
-        std::lock_guard<std::mutex> lk(stateMutex_);
+        std::string module = currentModule();
         for (int i = 0; i < labels.Count(); i++)
         {
             auto& L = labels[i];
-            if (toLower(L.mod) != module_)
+            if (toLower(L.mod) != module)
                 continue;
-            std::string text = L.text;
-            auto it = lastLabels_.find(L.rva);
-            if (forceAll || it == lastLabels_.end() || it->second != text)
-            {
-                lastLabels_[L.rva] = text;
-                sendSymbol(module_, L.rva, text);
-            }
+            sendSymbol(module, L.rva, L.text);
         }
     }
 
-    void scanComments(bool forceAll)
+    void scanComments()
     {
         BridgeList<Script::Comment::CommentInfo> comments;
         if (!Script::Comment::GetList(&comments))
             return;
-        std::lock_guard<std::mutex> lk(stateMutex_);
+        std::string module = currentModule();
         for (int i = 0; i < comments.Count(); i++)
         {
             auto& C = comments[i];
-            if (toLower(C.mod) != module_)
+            if (toLower(C.mod) != module)
                 continue;
-            std::string text = C.text;
-            auto it = lastComments_.find(C.rva);
-            if (forceAll || it == lastComments_.end() || it->second != text)
-            {
-                lastComments_[C.rva] = text;
-                sendComment(module_, C.rva, text);
-            }
+            sendComment(module, C.rva, C.text);
         }
     }
 
@@ -783,8 +839,7 @@ private:
     std::atomic<bool> runningPoll_{false};
     std::thread poll_;
     std::mutex stateMutex_;
-    std::map<duint, std::string> lastLabels_;
-    std::map<duint, std::string> lastComments_;
+    std::atomic<duint> mainModHash_{0};
     std::mutex typeMutex_;
     std::map<std::string, std::map<std::string, std::string>> typeDecls_;
     unsigned long long typeGeneration_ = 0;
@@ -876,6 +931,11 @@ static void CBCREATEPROCESS(CBTYPE, void*)
     g_adapter.onDebugStart();
 }
 
+static void CBDBOPERATION(CBTYPE, void* callbackInfo)
+{
+    g_adapter.onDbOperations((const PLUG_CB_DBOPERATION*)callbackInfo);
+}
+
 static void CBMENUENTRY(CBTYPE, void* callbackInfo)
 {
     PLUG_CB_MENUENTRY* info = (PLUG_CB_MENUENTRY*)callbackInfo;
@@ -904,6 +964,7 @@ bool pluginit(PLUG_INITSTRUCT* initStruct)
     g_pluginHandle = initStruct->pluginHandle;
     _plugin_registercallback(g_pluginHandle, CB_MENUENTRY, CBMENUENTRY);
     _plugin_registercallback(g_pluginHandle, CB_CREATEPROCESS, CBCREATEPROCESS);
+    _plugin_registercallback(g_pluginHandle, CB_DBOPERATION, CBDBOPERATION);
     _plugin_registercommand(g_pluginHandle, "symbridgeconnect", CBCONNECT, false);
     _plugin_registercommand(g_pluginHandle, "symbridgedisconnect", CBDISCONNECT, false);
     _plugin_registercommand(g_pluginHandle, "symbridgepush", CBPUSHALL, true);
@@ -918,6 +979,7 @@ bool plugstop()
     g_adapter.stop();
     _plugin_unregistercallback(g_pluginHandle, CB_MENUENTRY);
     _plugin_unregistercallback(g_pluginHandle, CB_CREATEPROCESS);
+    _plugin_unregistercallback(g_pluginHandle, CB_DBOPERATION);
     _plugin_unregistercommand(g_pluginHandle, "symbridgeconnect");
     _plugin_unregistercommand(g_pluginHandle, "symbridgedisconnect");
     _plugin_unregistercommand(g_pluginHandle, "symbridgepush");
